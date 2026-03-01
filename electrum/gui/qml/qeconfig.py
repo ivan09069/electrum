@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, QRegularExpression
 
 from electrum.bitcoin import TOTAL_COIN_SUPPLY_LIMIT_IN_BTC
-from electrum.i18n import set_language, languages
+from electrum.i18n import set_language, get_gui_lang_names
 from electrum.logging import get_logger
 from electrum.util import base_unit_name_to_decimal_point
 from electrum.gui import messages
@@ -52,7 +52,7 @@ class QEConfig(AuthMixin, QObject):
 
     @language.setter
     def language(self, language):
-        if language not in languages:
+        if language not in get_gui_lang_names():
             return
         if self.config.LOCALIZATION_LANGUAGE != language:
             self.config.LOCALIZATION_LANGUAGE = language
@@ -62,12 +62,9 @@ class QEConfig(AuthMixin, QObject):
     languagesChanged = pyqtSignal()
     @pyqtProperty('QVariantList', notify=languagesChanged)
     def languagesAvailable(self):
-        # sort on translated languages, then re-add Default on top
-        langs = copy.deepcopy(languages)
-        default = langs.pop('')
-        langs_sorted = sorted(list(map(lambda x: {'value': x[0], 'text': x[1]}, langs.items())), key=lambda x: x['text'])
-        langs_sorted.insert(0, {'value': '', 'text': default})
-        return langs_sorted
+        langs = get_gui_lang_names()
+        langs_list = list(map(lambda x: {'value': x[0], 'text': x[1]}, langs.items()))
+        return langs_list
 
     termsOfUseChanged = pyqtSignal()
     @pyqtProperty(bool, notify=termsOfUseChanged)
@@ -153,23 +150,26 @@ class QEConfig(AuthMixin, QObject):
         self.config.WALLET_PAYREQ_EXPIRY_SECONDS = expiry
         self.requestExpiryChanged.emit()
 
-    pinCodeChanged = pyqtSignal()
-    @pyqtProperty(str, notify=pinCodeChanged)
-    def pinCode(self):
-        return self.config.CONFIG_PIN_CODE or ""
+    paymentAuthenticationChanged = pyqtSignal()
+    @pyqtProperty(bool, notify=paymentAuthenticationChanged)
+    def paymentAuthentication(self):
+        return self.config.GUI_QML_PAYMENT_AUTHENTICATION
 
-    @pinCode.setter
-    def pinCode(self, pin_code):
-        if pin_code == '':
-            self.pinCodeRemoveAuth()
+    @paymentAuthentication.setter
+    def paymentAuthentication(self, enabled: bool):
+        if enabled:
+            self.config.GUI_QML_PAYMENT_AUTHENTICATION = True
+            self.paymentAuthenticationChanged.emit()
         else:
-            self.config.CONFIG_PIN_CODE = pin_code
-            self.pinCodeChanged.emit()
+            self._disable_payment_authentication()
 
-    @auth_protect(method='wallet_else_pin')
-    def pinCodeRemoveAuth(self):
-        self.config.CONFIG_PIN_CODE = ""
-        self.pinCodeChanged.emit()
+    @auth_protect(method='wallet', reject='_payment_auth_reject')
+    def _disable_payment_authentication(self):
+        self.config.GUI_QML_PAYMENT_AUTHENTICATION = False
+        self.paymentAuthenticationChanged.emit()
+
+    def _payment_auth_reject(self):
+        self.paymentAuthenticationChanged.emit()
 
     useGossipChanged = pyqtSignal()
     @pyqtProperty(bool, notify=useGossipChanged)

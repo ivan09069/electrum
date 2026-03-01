@@ -55,6 +55,7 @@ from .interface import GracefulDisconnect
 from .json_db import StoredDict
 from .invoices import PR_PAID
 from .fee_policy import FEE_LN_ETA_TARGET, FEERATE_PER_KW_MIN_RELAY_LIGHTNING
+from .channel_db import FLAG_DIRECTION
 
 if TYPE_CHECKING:
     from .lnworker import LNGossip, LNWallet
@@ -199,7 +200,8 @@ class Peer(Logger, EventListener):
         return chan
 
     def diagnostic_name(self):
-        return self.lnworker.__class__.__name__ + ', ' + self.transport.name()
+        lnw_name = self.lnworker.diagnostic_name() or self.lnworker.__class__.__name__
+        return lnw_name + ', ' + self.transport.name()
 
     async def ping_if_required(self):
         if time.time() - self.last_message_time > 30:
@@ -469,6 +471,12 @@ class Peer(Logger, EventListener):
             return
         for chan in self.channels.values():
             if payload['short_channel_id'] in [chan.short_channel_id, chan.get_local_scid_alias()]:
+                # originator: node_id_1 if the least-significant bit of flags is 0 or node_id_2 otherwise
+                flags = int.from_bytes(payload['channel_flags'], byteorder='big', signed=False)
+                originator = sorted(self.node_ids)[flags & FLAG_DIRECTION]
+                if originator == self.lnworker.node_keypair.pubkey:
+                    self.logger.debug(f"peer sent us our own channel update for chan {chan.get_id_for_log()}")
+                    return
                 chan.set_remote_update(payload)
                 self.logger.info(f"saved remote channel_update gossip msg for chan {chan.get_id_for_log()}")
                 break
@@ -491,6 +499,8 @@ class Peer(Logger, EventListener):
                 self.orphan_channel_updates.popitem(last=False)
 
     def on_announcement_signatures(self, chan: Channel, payload):
+        if not chan.is_public() or chan.short_channel_id is None:
+            return
         h = chan.get_channel_announcement_hash()
         node_signature = payload["node_signature"]
         bitcoin_signature = payload["bitcoin_signature"]
@@ -577,6 +587,7 @@ class Peer(Logger, EventListener):
                 for chan in public_channels:
                     if chan.is_open() and chan.peer_state == PeerState.GOOD:
                         self.maybe_send_channel_announcement(chan)
+                        self.maybe_send_channel_update(chan)
             await asyncio.sleep(600)
 
     def _should_forward_gossip(self) -> bool:
@@ -1781,6 +1792,10 @@ class Peer(Logger, EventListener):
         raw_msg = encode_msg(message_type, **payload)
         self.transport.send_bytes(raw_msg)
 
+    def maybe_send_channel_update(self, chan: Channel):
+        chan_upd = chan.get_outgoing_gossip_channel_update()
+        self.transport.send_bytes(chan_upd)
+
     def maybe_mark_open(self, chan: Channel):
         if not chan.sent_channel_ready:
             return
@@ -1805,16 +1820,15 @@ class Peer(Logger, EventListener):
         if pending_channel_update:
             chan.set_remote_update(pending_channel_update)
         self.logger.info(f"CHANNEL OPENING COMPLETED ({chan.get_id_for_log()})")
-        forwarding_enabled = self.network.config.EXPERIMENTAL_LN_FORWARD_PAYMENTS
-        if forwarding_enabled and chan.short_channel_id:
+        if chan.is_public():
             # send channel_update of outgoing edge to peer,
             # so that channel can be used to receive payments
-            self.logger.info(f"sending channel update for outgoing edge ({chan.get_id_for_log()})")
-            chan_upd = chan.get_outgoing_gossip_channel_update()
-            self.transport.send_bytes(chan_upd)
+            # Note: this is only useful for our unit tests. peers may discard
+            # channel updates if the channel has not been announced
+            self.maybe_send_channel_update(chan)
 
     def maybe_send_announcement_signatures(self, chan: Channel, is_reply=False):
-        if not chan.is_public():
+        if not chan.is_public() or chan.short_channel_id is None:
             return
         if chan.sent_announcement_signatures:
             return
@@ -1969,7 +1983,6 @@ class Peer(Logger, EventListener):
                 f"chan={chan.get_id_for_log()}. {htlc_id=}. {chan.get_state()=!r}. {chan.peer_state=!r}")
             return
         chan.receive_htlc_settle(preimage, htlc_id)  # TODO handle exc and maybe fail channel (e.g. bad htlc_id)
-        self.lnworker.save_preimage(payment_hash, preimage)
         self.maybe_send_commitment(chan)
 
     def on_update_fail_malformed_htlc(self, chan: Channel, payload):
@@ -2200,7 +2213,7 @@ class Peer(Logger, EventListener):
         # get payment hash of any htlc in the set (they are all the same)
         payment_hash = htlc_set.get_payment_hash()
         assert payment_hash is not None, htlc_set
-        assert payment_hash not in self.lnworker.dont_settle_htlcs
+        assert payment_hash.hex() not in self.lnworker.dont_settle_htlcs
         self.lnworker.dont_expire_htlcs.pop(payment_hash.hex(), None)  # htlcs wont get expired anymore
         for mpp_htlc in list(htlc_set.htlcs):
             htlc_id = mpp_htlc.htlc.htlc_id
@@ -2214,12 +2227,14 @@ class Peer(Logger, EventListener):
             if chan.hm.was_htlc_preimage_released(htlc_id=htlc_id, htlc_proposer=REMOTE):
                 # this check is intended to gracefully handle stale htlcs in the set, e.g. after a crash
                 self.logger.debug(f"{mpp_htlc=} was already settled before, dropping it.")
-                htlc_set.htlcs.remove(mpp_htlc)
+                htlc_set = htlc_set._replace(htlcs=htlc_set.htlcs - {mpp_htlc})
                 continue
             self._fulfill_htlc(chan, htlc_id, preimage)
-            htlc_set.htlcs.remove(mpp_htlc)
+            htlc_set = htlc_set._replace(htlcs=htlc_set.htlcs - {mpp_htlc})
             # reset just-in-time opening fee of channel
             chan.jit_opening_fee = None
+
+        self.lnworker.received_mpp_htlcs[payment_key] = htlc_set  # save updated set
 
     def _fulfill_htlc(self, chan: Channel, htlc_id: int, preimage: bytes):
         assert chan.hm.is_htlc_irrevocably_added_yet(htlc_proposer=REMOTE, htlc_id=htlc_id)
@@ -2255,7 +2270,7 @@ class Peer(Logger, EventListener):
             if chan.hm.was_htlc_failed(htlc_id=htlc_id, htlc_proposer=REMOTE):
                 # this check is intended to gracefully handle stale htlcs in the set, e.g. after a crash
                 self.logger.debug(f"{mpp_htlc=} was already failed before, dropping it.")
-                htlc_set.htlcs.remove(mpp_htlc)
+                htlc_set = htlc_set._replace(htlcs=htlc_set.htlcs - {mpp_htlc})
                 continue
             onion_packet = self._parse_onion_packet(mpp_htlc.unprocessed_onion)
             processed_onion_packet = self._process_incoming_onion_packet(
@@ -2286,7 +2301,9 @@ class Peer(Logger, EventListener):
                 htlc_id=htlc_id,
                 error_bytes=error_bytes,
             )
-            htlc_set.htlcs.remove(mpp_htlc)
+            htlc_set = htlc_set._replace(htlcs=htlc_set.htlcs - {mpp_htlc})
+
+        self.lnworker.received_mpp_htlcs[payment_key] = htlc_set  # save updated set
 
     def fail_htlc(self, *, chan: Channel, htlc_id: int, error_bytes: bytes):
         self.logger.info(f"fail_htlc. chan {chan.short_channel_id}. htlc_id {htlc_id}.")
@@ -3148,11 +3165,12 @@ class Peer(Logger, EventListener):
             if not parent:
                 parent = ReceivedMPPStatus(
                     resolution=RecvMPPResolution.WAITING,
-                    htlcs=set(),
+                    htlcs=frozenset(),
                 )
-                self.lnworker.received_mpp_htlcs[mpp_set.parent_set_key] = parent
-            parent.htlcs.update(mpp_set.htlcs)
-            mpp_set.htlcs.clear()
+            self.lnworker.received_mpp_htlcs[mpp_set.parent_set_key] = parent._replace(
+                htlcs=parent.htlcs | mpp_set.htlcs
+            )
+            self.lnworker.received_mpp_htlcs[payment_key] = mpp_set._replace(htlcs=frozenset())
             return None, None, None  # this set will get deleted as there are no htlcs in it anymore
 
         assert not mpp_set.parent_set_key

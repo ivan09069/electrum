@@ -562,11 +562,12 @@ class Abstract_Wallet(ABC, Logger, EventListener):
         self.unregister_callbacks()
         try:
             async with ignore_after(5):
+                if self.lnworker:
+                    await self.lnworker.stop()
+                    self.lnworker = None
                 if self.network:
-                    if self.lnworker:
-                        await self.lnworker.stop()
-                        self.lnworker = None
                     self.network = None
+                if self.taskgroup:
                     await self.taskgroup.cancel_remaining()
                     self.taskgroup = None
                 await self.adb.stop()
@@ -2018,16 +2019,17 @@ class Abstract_Wallet(ABC, Logger, EventListener):
                 # make sure we don't try to spend change from the tx-to-be-replaced:
                 coins = [c for c in coins if c.prevout.txid.hex() != base_tx.txid()]
                 is_local = self.adb.get_tx_height(base_tx.txid()).height() == TX_HEIGHT_LOCAL
+                # estimate base tx fee before stripping tx for more accurate estimate
+                base_tx_fee = base_tx.get_fee()
+                base_feerate = Decimal(base_tx_fee)/base_tx.estimated_size()
+                relayfeerate = Decimal(self.relayfee()) / 1000
+                original_fee_estimator = fee_estimator
                 if not isinstance(base_tx, PartialTransaction):
                     base_tx = PartialTransaction.from_tx(base_tx)
                     base_tx.add_info_from_wallet(self)
                 else:
                     # don't cast PartialTransaction, because it removes make_witness
                     base_tx.remove_signatures()
-                base_tx_fee = base_tx.get_fee()
-                base_feerate = Decimal(base_tx_fee)/base_tx.estimated_size()
-                relayfeerate = Decimal(self.relayfee()) / 1000
-                original_fee_estimator = fee_estimator
                 def fee_estimator(size: Union[int, float, Decimal]) -> int:
                     size = Decimal(size)
                     lower_bound_relayfee = int(base_tx_fee + round(size * relayfeerate)) if not is_local else 0
@@ -2058,11 +2060,14 @@ class Abstract_Wallet(ABC, Logger, EventListener):
                 fee_estimator_vb=fee_estimator,
                 dust_threshold=self.dust_threshold(),
                 BIP69_sort=BIP69_sort)
-            if self.lnworker and send_change_to_lightning:
+            if send_change_to_lightning and self.lnworker and self.lnworker.swap_manager.is_initialized.is_set():
+                sm = self.lnworker.swap_manager
                 change = tx.get_change_outputs()
                 if len(change) == 1:
                     amount = change[0].value
-                    if amount <= self.lnworker.num_sats_can_receive():
+                    min_swap_amount = sm.get_min_amount()
+                    max_swap_amount = sm.client_max_amount_forward_swap() or 0
+                    if min_swap_amount <= amount <= max_swap_amount:
                         tx.replace_output_address(change[0].address, DummyAddress.SWAP)
             if self.should_keep_reserve_utxo(tx.inputs(), tx.outputs(), is_anchor_channel_opening):
                 raise NotEnoughFunds()
@@ -2298,6 +2303,7 @@ class Abstract_Wallet(ABC, Logger, EventListener):
               Without that, all txins must be ismine.
         """
         assert tx
+        old_tx_size = tx.estimated_size()  # estimate before stripping tx for more accurate estimate
         if not isinstance(tx, PartialTransaction):
             tx = PartialTransaction.from_tx(tx)
         assert isinstance(tx, PartialTransaction)
@@ -2308,7 +2314,6 @@ class Abstract_Wallet(ABC, Logger, EventListener):
         tx.add_info_from_wallet(self)
         if tx.is_missing_info_from_network():
             raise Exception("tx missing info from network")
-        old_tx_size = tx.estimated_size()
         old_fee = tx.get_fee()
         assert old_fee is not None
         old_fee_rate = old_fee / old_tx_size  # sat/vbyte
@@ -2568,6 +2573,7 @@ class Abstract_Wallet(ABC, Logger, EventListener):
               Without that, all txins must be ismine.
         """
         assert tx
+        old_tx_size = tx.estimated_size()  # estimate before stripping tx for more accurate estimate
         if not isinstance(tx, PartialTransaction):
             tx = PartialTransaction.from_tx(tx)
         assert isinstance(tx, PartialTransaction)
@@ -2579,7 +2585,6 @@ class Abstract_Wallet(ABC, Logger, EventListener):
         tx.add_info_from_wallet(self)
         if tx.is_missing_info_from_network():
             raise Exception("tx missing info from network")
-        old_tx_size = tx.estimated_size()
         old_fee = tx.get_fee()
         assert old_fee is not None
         old_fee_rate = old_fee / old_tx_size  # sat/vbyte
@@ -3532,16 +3537,27 @@ class Abstract_Wallet(ABC, Logger, EventListener):
         """Returns the number of new addresses we generated."""
         return 0
 
-    def unlock(self, password):
+    def unlock(self, password: Optional[str]) -> None:
         self.logger.info(f'unlocking wallet')
+        password = password or None
         self.check_password(password)
         self._password_in_memory = password
 
     def lock_wallet(self):
         self._password_in_memory = None
 
-    def get_unlocked_password(self):
-        return self._password_in_memory
+    def get_unlocked_password(self) -> Optional[str]:
+        pw = self._password_in_memory
+        if not self.is_unlocked():
+            return None
+        try:
+            self.check_password(pw)
+        except InvalidPassword as e:
+            raise Exception("inconsistent _password_in_memory") from e
+        return pw
+
+    def is_unlocked(self) -> bool:
+        return self._password_in_memory is not None or not self.has_password()
 
     def get_text_not_enough_funds_mentioning_frozen(
             self,
@@ -3598,6 +3614,82 @@ class Abstract_Wallet(ABC, Logger, EventListener):
         self.logger.info(f'added future tx: {name}. prevout: {prevout}')
         util.trigger_callback('wallet_updated', self)
         self.adb.set_future_tx(tx.txid(), wanted_height=wanted_height)
+
+    def export_history_to_file(self, *, fx: Optional['FxThread'], file_path: str, is_csv: bool):
+        """Create a file containing the wallet history in either json or csv format, e.g. for bookkeeping."""
+        if run_hook('export_history_to_file', self, fx, file_path, is_csv):
+            return  # allow for plugins to create history fancy export
+        txns = self.get_full_history(fx=fx)
+        # remove unconfirmed/local tx as their ordering is not deterministic, and they don't seem
+        # useful for a wallet export (can't do accounting on a tx that hasn't happened yet)
+        txns = {k: v for k, v in txns.items() if v['timestamp'] not in (None, 0)}
+
+        def get_all_fees_paid_by_item(h_item: dict) -> Tuple[int, Optional[Fiat]]:
+            # gets all fees paid in an item (or group), as the outer group doesn't contain the
+            # transaction fees paid by the children
+            fees_sat = 0
+            fees_fiat = Fiat(ccy=fx.ccy, value=Decimal()) if fx else None
+            for child in h_item.get('children', []):
+                fees_sat += child['fee_sat'] or 0 if 'fee_sat' in child \
+                    else (child.get('fee_msat', 0) or 0) // 1000  # FIXME: loses msat precision
+                if fees_fiat is not None and (child_fiat_fee := child.get('fiat_fee')):
+                    fees_fiat += child_fiat_fee
+
+            fees_sat += h_item['fee_sat'] or 0 if 'fee_sat' in h_item \
+                else (h_item.get('fee_msat', 0) or 0) // 1000  # FIXME: loses msat precision
+            if fees_fiat is not None and (h_item_fiat_fee := h_item.get('fiat_fee')):
+                fees_fiat += h_item_fiat_fee
+
+            fiat_value = h_item.get('fiat_value')
+            if fees_fiat is not None and isinstance(fiat_value, Fiat) \
+                    and (fiat_value.value is None or fiat_value.value.is_nan()):
+                # ensure that str(fees_fiat) == 'No Data' if str(fiat_value) == 'No Data'
+                fees_fiat = Fiat(ccy=fx.ccy, value=None)
+
+            return fees_sat, fees_fiat
+
+        lines = []
+        if is_csv:
+            # sort by timestamp so the generated csv is more understandable on first sight
+            txns = dict(sorted(txns.items(), key=lambda h_item: h_item[1]['timestamp']))
+            for item in txns.values():
+                # tx groups will are shown as single element
+                fees_sat, fees_fiat = get_all_fees_paid_by_item(item)
+                # users are sensitive to changes of these fields as they have scripts/spreadsheets
+                # depending on them. E.g. https://github.com/spesmilo/electrum/issues/10445
+                assert str(fees_fiat) == 'No Data' if str(item.get('fiat_value')) == 'No Data' else True
+                line = [
+                    item.get('txid', ''),
+                    item.get('payment_hash', ''),
+                    item.get('label', ''),
+                    item.get('confirmations', ''),
+                    item['bc_value'],
+                    item['ln_value'],
+                    item.get('fiat_value', ''),
+                    util.format_satoshis(fees_sat),
+                    str(fees_fiat or ''),
+                    item['date']
+                ]
+                lines.append(line)
+
+        with open(file_path, "w+", encoding='utf-8') as f:
+            if is_csv:
+                import csv
+                transaction = csv.writer(f, lineterminator='\n')
+                transaction.writerow(["oc_transaction_hash",
+                                      "ln_payment_hash",
+                                      "label",
+                                      "confirmations",
+                                      "amount_chain_bc",
+                                      "amount_lightning_bc",
+                                      "fiat_value",
+                                      "network_fee_bc",
+                                      "fiat_fee",
+                                      "timestamp"])
+                for line in lines:
+                    transaction.writerow(line)
+            else:
+                f.write(util.json_encode(txns))
 
 
 class Simple_Wallet(Abstract_Wallet):
@@ -3769,7 +3861,10 @@ class Imported_Wallet(Simple_Wallet):
         return self.db.has_imported_address(address)
 
     def get_address_index(self, address) -> Optional[str]:
-        # returns None if address is not mine
+        # Return pubkey for address if we know it.
+        # If we don't know it, return None, which might happen:
+        # - if address is not is_mine
+        # - if this is an "imported address", we don't have the pubkey for. (watch-only imported wallet)
         return self.get_public_key(address)
 
     def get_address_path_str(self, address):

@@ -571,7 +571,7 @@ class TestCommandsTestnet(ElectrumTestCase):
                 wallet=wallet,
             )
         assert settle_result['settled'] == payment_hash
-        assert wallet.lnworker._preimages[payment_hash] == preimage.hex()
+        assert wallet.lnworker._preimages[payment_hash][0] == preimage.hex()
         with (mock.patch.object(
             wallet.lnworker,
             'get_payment_value',
@@ -591,8 +591,7 @@ class TestCommandsTestnet(ElectrumTestCase):
     @mock.patch.object(storage.WalletStorage, 'append')
     async def test_onchain_history(self, *mock_args):
         cmds = Commands(config=self.config, daemon=self.daemon)
-        WALLET_FILES_DIR = os.path.join(os.path.dirname(__file__), "test_storage_upgrade")
-        wallet_path = os.path.join(WALLET_FILES_DIR, "client_3_3_8_xpub_with_realistic_history")
+        wallet_path = self.get_wallet_file_path("client_3_3_8_xpub_with_realistic_history")
         await cmds.load_wallet(wallet_path=wallet_path)
 
         expected_last_history_item = {

@@ -225,7 +225,6 @@ class LNPeerManager(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
         features: LnFeatures,
         config: 'SimpleConfig',
     ):
-        Logger.__init__(self)
         NetworkRetryManager.__init__(
             self,
             max_retry_delay_normal=3600,
@@ -236,6 +235,7 @@ class LNPeerManager(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
         self.lock = threading.RLock()
         self.node_keypair = node_keypair
         self._lnwallet_or_lngossip = lnwallet_or_lngossip
+        Logger.__init__(self)
         self._peers = {}  # type: Dict[bytes, Peer]  # pubkey -> Peer  # needs self.lock
         self._channelless_incoming_peers = set()  # type: Set[bytes]  # node_ids  # needs self.lock
         self.taskgroup = OldTaskGroup()
@@ -245,6 +245,10 @@ class LNPeerManager(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
         self.config = config
         self.stopping_soon = False  # whether we are being shut down
         self.register_callbacks()
+
+    def diagnostic_name(self):
+        lnw = self._lnwallet_or_lngossip
+        return lnw.diagnostic_name() or lnw.__class__.__name__
 
     @property
     def channel_db(self) -> 'ChannelDB':
@@ -479,6 +483,8 @@ class LNPeerManager(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
                 continue
             if not self.is_good_peer(peer):
                 continue
+            if peer.is_onion() and not self.network.proxy or not self.network.proxy.enabled:
+                continue
             return [peer]
         # try random peer from graph
         unconnected_nodes = self.channel_db.get_200_randomly_sorted_nodes_not_in(self.peers.keys())
@@ -487,7 +493,10 @@ class LNPeerManager(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
                 addrs = self.channel_db.get_node_addresses(node_id)
                 if not addrs:
                     continue
-                host, port, timestamp = self.choose_preferred_address(list(addrs))
+                address = self.choose_preferred_address(list(addrs))
+                if not address:
+                    continue
+                host, port, timestamp = address
                 try:
                     peer = LNPeerAddr(host, port, node_id)
                 except ValueError:
@@ -546,15 +555,17 @@ class LNPeerManager(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
         self.logger.info(f'got {len(peers)} ln peers from dns seed')
         return peers
 
-    @staticmethod
-    def choose_preferred_address(addr_list: Sequence[Tuple[str, int, int]]) -> Tuple[str, int, int]:
+    def choose_preferred_address(self, addr_list: Sequence[Tuple[str, int, int]]) -> Optional[Tuple[str, int, int]]:
         assert len(addr_list) >= 1
         # choose the most recent one that is an IP
         for host, port, timestamp in sorted(addr_list, key=lambda a: -a[2]):
             if is_ip_address(host):
                 return host, port, timestamp
+        if not self.network.proxy or not self.network.proxy.enabled:
+            addr_list = [(h, p, ts) for h, p, ts in addr_list if not h.endswith('.onion')]
+        if not addr_list:
+            return None
         # otherwise choose one at random
-        # TODO maybe filter out onion if not on tor?
         choice = random.choice(addr_list)
         return choice
 
@@ -579,12 +590,12 @@ class LNPeerManager(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
                     host, port = addr.host, addr.port
                 else:
                     addrs = self.channel_db.get_node_addresses(node_id)
-                    if not addrs:
+                    if not addrs or not (address := self.choose_preferred_address(list(addrs))):
                         raise ConnStringFormatError(_('Don\'t know any addresses for node:') + ' ' + node_id.hex())
-                    host, port, timestamp = self.choose_preferred_address(list(addrs))
+                    host, port, timestamp = address
             port = int(port)
 
-            if not self.network.proxy:
+            if not self.network.proxy or not self.network.proxy.enabled:
                 # Try DNS-resolving the host (if needed). This is simply so that
                 # the caller gets a nice exception if it cannot be resolved.
                 # (we don't do the DNS lookup if a proxy is set, to avoid a DNS-leak)
@@ -772,6 +783,8 @@ class LNGossip(Logger):
             progress_percent = 0
         return current_est, total_est, progress_percent
 
+    @ignore_exceptions
+    @log_exceptions
     async def process_gossip(self, chan_anns, node_anns, chan_upds):
         # note: we run in the originating peer's TaskGroup, so we can safely raise here
         #       and disconnect only from that peer
@@ -1009,7 +1022,7 @@ class LNWallet(Logger):
         self.lnrater: LNRater = None
         # "RHASH:direction" -> amount_msat, status, min_final_cltv_delta, expiry_delay, creation_ts, invoice_features
         self.payment_info = self.db.get_dict('lightning_payments')  # type: dict[str, Tuple[Optional[int], int, int, int, int, int]]
-        self._preimages = self.db.get_dict('lightning_preimages')   # RHASH -> preimage
+        self._preimages = self.db.get_dict('lightning_preimages')   # RHASH -> (preimage, is_public)
         self._bolt11_cache = {}
         # note: this sweep_address is only used as fallback; as it might result in address-reuse
         self.logs = defaultdict(list)  # type: Dict[str, List[HtlcLog]]  # key is RHASH  # (not persisted)
@@ -1227,7 +1240,8 @@ class LNWallet(Logger):
         #       that we can already fail/fulfill. e.g. forwarded htlcs cannot be removed
         async with OldTaskGroup() as group:
             for peer in self.lnpeermgr.peers.values():
-                await group.spawn(peer.wait_one_htlc_switch_iteration())
+                if peer.is_initialized():
+                    await group.spawn(peer.wait_one_htlc_switch_iteration())
         while True:
             if all(not peer.received_htlcs_pending_removal for peer in self.lnpeermgr.peers.values()):
                 break
@@ -1914,6 +1928,7 @@ class LNWallet(Logger):
             f"pay_to_node starting session for RHASH={payment_hash.hex()}. "
             f"using_trampoline={self.uses_trampoline()}. "
             f"invoice_features={paysession.invoice_features.get_names()}. "
+            f"r_tags={LnAddr.format_bolt11_routing_info_as_human_readable(r_tags)}. "
             f"{amount_to_pay=} msat. {budget=}")
         if not self.uses_trampoline():
             self.logger.info(
@@ -2556,7 +2571,8 @@ class LNWallet(Logger):
         assert amount_msat is None or amount_msat > 0
         timestamp = int(time.time())
         routing_hints = self.calc_routing_hints_for_invoice(amount_msat, channels=channels)
-        self.logger.info(f"creating bolt11 invoice with routing_hints: {routing_hints}, sat: {(amount_msat or 0) // 1000}")
+        formatted_r_hints = LnAddr.format_bolt11_routing_info_as_human_readable(routing_hints, has_explicit_r_tagtype=True)
+        self.logger.info(f"creating bolt11 invoice with routing_hints: {formatted_r_hints}, sat: {(amount_msat or 0) // 1000}")
         payment_secret = self.get_payment_secret(payment_info.payment_hash)
         amount_btc = amount_msat/Decimal(COIN*1000) if amount_msat else None
         min_final_cltv_delta = payment_info.min_final_cltv_delta + MIN_FINAL_CLTV_DELTA_BUFFER_INVOICE
@@ -2683,19 +2699,32 @@ class LNWallet(Logger):
                 del self._payment_bundles_pkey_to_canon[pkey]
             del self._payment_bundles_canon_to_pkeylist[canon_pkey]
 
-    def save_preimage(self, payment_hash: bytes, preimage: bytes, *, write_to_disk: bool = True):
+    def save_preimage(
+        self,
+        payment_hash: bytes,
+        preimage: bytes,
+        *,
+        write_to_disk: bool = True,
+        mark_as_public: bool = False,  # see is_preimage_public
+    ):
+        assert isinstance(payment_hash, bytes), f"expected bytes, but got {type(payment_hash)}"
+        assert isinstance(preimage, bytes), f"expected bytes, but got {type(preimage)}"
         if sha256(preimage) != payment_hash:
             raise Exception("tried to save incorrect preimage for payment_hash")
-        if self._preimages.get(payment_hash.hex()) is not None:
-            return  # we already have this preimage
-        self.logger.debug(f"saving preimage for {payment_hash.hex()}")
-        self._preimages[payment_hash.hex()] = preimage.hex()
+        old_tuple = _, old_is_public = self._preimages.get(payment_hash.hex(), (None, False))
+        mark_as_public |= old_is_public  # disallow True->False transition
+        # sanity checks and conversions done.
+        new_tuple = preimage.hex(), mark_as_public
+        if old_tuple == new_tuple:  # no change
+            return
+        self.logger.debug(f"saving preimage for {payment_hash.hex()} (public={mark_as_public})")
+        self._preimages[payment_hash.hex()] = new_tuple
         if write_to_disk:
             self.wallet.save_db()
 
     def get_preimage(self, payment_hash: bytes) -> Optional[bytes]:
         assert isinstance(payment_hash, bytes), f"expected bytes, but got {type(payment_hash)}"
-        preimage_hex = self._preimages.get(payment_hash.hex())
+        preimage_hex, _ = self._preimages.get(payment_hash.hex(), (None, None))
         if preimage_hex is None:
             return None
         preimage_bytes = bytes.fromhex(preimage_hex)
@@ -2706,6 +2735,20 @@ class LNWallet(Logger):
     def get_preimage_hex(self, payment_hash: str) -> Optional[str]:
         preimage_bytes = self.get_preimage(bytes.fromhex(payment_hash)) or b""
         return preimage_bytes.hex() or None
+
+    def is_preimage_public(self, payment_hash: bytes) -> bool:
+        """If another LN node knows a preimage besides us, we consider it public.
+        If a preimage is public, it is safe to reveal it in an arbitrary context.
+
+        For example, if there is a pending incoming partial MPP for an invoice we created,
+        we must not reveal the preimage, otherwise we will get paid less than invoice amount.
+        What if there is a force-close around that time? When is it safe to reveal the preimage on-chain?
+        e.g. if we already revealed the preimage either offchain or onchain, it is fine to reveal it again.
+        """
+        assert isinstance(payment_hash, bytes), f"expected bytes, but got {type(payment_hash)}"
+        preimage_hex, is_public = self._preimages.get(payment_hash.hex(), (None, None))
+        assert preimage_hex is not None
+        return bool(is_public)
 
     def get_payment_info(self, payment_hash: bytes, *, direction: lnutil.Direction) -> Optional[PaymentInfo]:
         """returns None if payment_hash is a payment we are forwarding"""
@@ -2806,7 +2849,7 @@ class LNWallet(Logger):
             self.logger.debug(f"creating new mpp set for {payment_key=}")
             mpp_status = ReceivedMPPStatus(
                 resolution=RecvMPPResolution.WAITING,
-                htlcs=set(),
+                htlcs=frozenset(),
             )
 
         if mpp_status.resolution > RecvMPPResolution.WAITING:
@@ -2826,8 +2869,9 @@ class LNWallet(Logger):
         )
         assert new_htlc not in mpp_status.htlcs, "each htlc should make it here only once?"
         assert isinstance(unprocessed_onion_packet, str)
-        mpp_status.htlcs.add(new_htlc)  # side-effecting htlc_set
-        self.received_mpp_htlcs[payment_key] = mpp_status
+        new_htlcs = set(mpp_status.htlcs)
+        new_htlcs.add(new_htlc)
+        self.received_mpp_htlcs[payment_key] = mpp_status._replace(htlcs=frozenset(new_htlcs))
 
     def set_mpp_resolution(self, payment_key: str, new_resolution: RecvMPPResolution) -> ReceivedMPPStatus:
         mpp_status = self.received_mpp_htlcs[payment_key]
@@ -2909,10 +2953,14 @@ class LNWallet(Logger):
         assert chan._state == ChannelState.REDEEMED
         for payment_key_hex, mpp_status in list(self.received_mpp_htlcs.items()):
             htlcs_to_remove = [htlc for htlc in mpp_status.htlcs if htlc.channel_id == chan.channel_id]
+            new_htlcs = set(mpp_status.htlcs)
             for stale_mpp_htlc in htlcs_to_remove:
                 assert mpp_status.resolution != RecvMPPResolution.WAITING
                 self.logger.info(f'maybe_cleanup_mpp: removing htlc of MPP {payment_key_hex}')
-                mpp_status.htlcs.remove(stale_mpp_htlc)  # side-effecting htlc_set
+                new_htlcs.remove(stale_mpp_htlc)
+            if htlcs_to_remove:
+                mpp_status = mpp_status._replace(htlcs=frozenset(new_htlcs))
+                self.received_mpp_htlcs[payment_key_hex] = mpp_status  # save changes to db
             if len(mpp_status.htlcs) == 0:
                 self.logger.info(f'maybe_cleanup_mpp: removing mpp {payment_key_hex}')
                 del self.received_mpp_htlcs[payment_key_hex]
@@ -3897,7 +3945,7 @@ class LNWallet(Logger):
                 invoice_features = payload["invoice_features"]["invoice_features"]
                 invoice_routing_info = payload["invoice_routing_info"]["invoice_routing_info"]
                 r_tags = decode_routing_info(invoice_routing_info)
-                self.logger.info(f'r_tags {r_tags}')
+                self.logger.info(f'r_tags {LnAddr.format_bolt11_routing_info_as_human_readable(r_tags)}')
                 # TODO legacy mpp payment, use total_msat from trampoline onion
             else:
                 self.logger.info('forward_trampoline: end-to-end')

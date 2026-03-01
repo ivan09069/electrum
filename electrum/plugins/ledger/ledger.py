@@ -403,10 +403,10 @@ class Ledger_Client_Legacy(Ledger_Client):
                 self.signing = False
         return wrapper
 
-    def give_error(self, message):
+    def give_error(self, message: str | BaseException):
         _logger.info(message)
         if not self.signing:
-            self.handler.show_error(message)
+            self.handler.show_error(str(message))
         else:
             self.signing = False
         raise UserFacingException(message)
@@ -545,10 +545,10 @@ class Ledger_Client_Legacy(Ledger_Client):
                     _('Your device might not have support for this functionality.')))
             else:
                 _logger.exception('')
-                self.handler.show_error(e)
+                self.handler.show_error(str(e))
         except BaseException as e:
             _logger.exception('')
-            self.handler.show_error(e)
+            self.handler.show_error(str(e))
         finally:
             self.handler.finished()
 
@@ -959,7 +959,7 @@ class Ledger_Client_New(Ledger_Client):
             pass  # cancelled by user
         except BaseException as e:
             _logger.exception('Error while showing an address')
-            self.handler.show_error(e)
+            self.handler.show_error(str(e))
         finally:
             self.handler.finished()
 
@@ -1139,7 +1139,7 @@ class Ledger_Client_New(Ledger_Client):
             pass  # cancelled by user
         except BaseException as e:
             _logger.exception('Error while signing')
-            self.handler.show_error(e)
+            self.handler.show_error(str(e))
         finally:
             self.handler.finished()
 
@@ -1166,7 +1166,7 @@ class Ledger_Client_New(Ledger_Client):
             pass  # cancelled by user
         except BaseException as e:
             _logger.exception('')
-            self.handler.show_error(e)
+            self.handler.show_error(str(e))
         finally:
             self.handler.finished()
 
@@ -1228,7 +1228,7 @@ class LedgerPlugin(HW_PluginBase):
                   (0x2c97, 0x0005),  # Nano-S Plus
                   (0x2c97, 0x0006),  # Stax
                   (0x2c97, 0x0007),  # Flex
-                  (0x2c97, 0x0008),  # RFU
+                  (0x2c97, 0x0008),  # Nano Gen5
                   (0x2c97, 0x0009),  # RFU
                   (0x2c97, 0x000a)]  # RFU
     VENDOR_IDS = (0x2c97,)
@@ -1238,6 +1238,7 @@ class LedgerPlugin(HW_PluginBase):
         0x50: "Ledger Nano S Plus",
         0x60: "Ledger Stax",
         0x70: "Ledger Flex",
+        0x80: "Ledger Nano Gen5",
     }
 
     SUPPORTED_XTYPES = ('standard', 'p2wpkh-p2sh', 'p2wpkh', 'p2wsh-p2sh', 'p2wsh')
@@ -1289,6 +1290,8 @@ class LedgerPlugin(HW_PluginBase):
                 return True, "Ledger Stax"
             if product_key == (0x2c97, 0x0007):
                 return True, "Ledger Flex"
+            if product_key == (0x2c97, 0x0008):
+                return True, "Ledger Nano Gen5"
             return True, None
         # modern product_keys
         if product_key[0] == 0x2c97:

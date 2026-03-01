@@ -73,7 +73,7 @@ from electrum.exchange_rate import FxThread
 from electrum.simple_config import SimpleConfig
 from electrum.logging import Logger
 from electrum.lntransport import extract_nodeid, ConnStringFormatError
-from electrum.lnaddr import lndecode
+from electrum.lnaddr import lndecode, LnAddr
 from electrum.submarine_swaps import SwapServerTransport, NostrTransport
 from electrum.fee_policy import FeePolicy
 
@@ -96,7 +96,7 @@ from .wizard.wallet import WIF_HELP_TEXT
 from .history_list import HistoryList, HistoryModel
 from .update_checker import UpdateCheck, UpdateCheckThread
 from .channels_list import ChannelsList
-from .confirm_tx_dialog import ConfirmTxDialog
+from .confirm_tx_dialog import ConfirmTxDialog, TxEditorContext
 from .rbf_dialog import BumpFeeDialog, DSCancelDialog
 from .qrreader import scan_qrcode_from_camera
 from .swap_dialog import SwapDialog, InvalidSwapParameters
@@ -736,7 +736,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
         return True
 
     def update_recently_opened_menu(self):
-        recent = self.config.RECENTLY_OPEN_WALLET_FILES
+        recent = self.config.RECENTLY_OPEN_WALLET_FILES or []
         self.recently_visited_menu.clear()
         for i, k in enumerate(recent):
             b = os.path.basename(k)
@@ -847,6 +847,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
             about_action.triggered.connect(self.show_about)
             about_action.setMenuRole(QAction.MenuRole.AboutRole)  # make sure OS recognizes it as "About"
             self.help_menu.addAction(about_action)
+        self.help_menu.addAction(_("&Changelog"), lambda: webopen(constants.RELEASE_NOTES_URL))
         self.help_menu.addAction(_("&Check for updates"), self.show_update_check)
         self.help_menu.addAction(_("&Official website"), lambda: webopen("https://electrum.org"))
         self.help_menu.addSeparator()
@@ -855,7 +856,8 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
             self.help_menu.addAction(_("&Bitcoin Paper"), self.show_bitcoin_paper)
         self.help_menu.addAction(_("&Report Bug"), self.show_report_bug)
         self.help_menu.addSeparator()
-        self.help_menu.addAction(_("&Donate to server"), self.donate_to_server)
+        if self.network:
+            self.help_menu.addAction(_("&Donate to server"), self.donate_to_server)
 
         run_hook('init_menubar', self)
         self.setMenuBar(menubar)
@@ -885,7 +887,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
             def fetch_bitcoin_paper():
                 s = self._fetch_tx_from_network("54e48e5f5c656b26c3bca14a8c95aa583d07ebe84dde3b7dd4a78f4e4186e713")
                 if not s:
-                    return
+                    raise concurrent.futures.CancelledError
                 s = s.split("0100000000000000")[1:-1]
                 out = ''.join(x[6:136] + x[138:268] + x[270:400] if len(x) > 136 else x[6:] for x in s)[16:-20]
                 with open(filename, 'wb') as f:
@@ -1504,7 +1506,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
                 return
         # we need to know the fee before we broadcast, because the txid is required
         make_tx = self.mktx_for_open_channel(funding_sat=funding_sat, node_id=node_id)
-        funding_tx, _, _ = self.confirm_tx_dialog(make_tx, funding_sat, allow_preview=False)
+        funding_tx, _, _ = self.confirm_tx_dialog(make_tx, funding_sat, context=TxEditorContext.CHANNEL_FUNDING)
         if not funding_tx:
             return
         self._open_channel(connect_str, funding_sat, push_amt, funding_tx)
@@ -1514,7 +1516,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
         make_tx,
         output_value, *,
         payee_outputs: Optional[list[TxOutput]] = None,
-        allow_preview=True,
+        context: TxEditorContext = TxEditorContext.PAYMENT,
         batching_candidates=None,
     ) -> tuple[Optional[PartialTransaction], bool, bool]:
         d = ConfirmTxDialog(
@@ -1522,7 +1524,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
             make_tx=make_tx,
             output_value=output_value,
             payee_outputs=payee_outputs,
-            allow_preview=allow_preview,
+            context=context,
             batching_candidates=batching_candidates,
         )
         return d.run(), d.is_preview, d.did_swap
@@ -1746,7 +1748,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger, QtEventListener):
         grid.addWidget(QLabel(_('Text') + ':'), 8, 0)
         grid.addWidget(invoice_e, 8, 1)
         r_tags = lnaddr.get_routing_info('r')
-        r_tags = '\n'.join(repr([(x[0].hex(), format_short_id(x[1]), x[2], x[3]) for x in r]) for r in r_tags)
+        r_tags = '\n'.join(repr(r) for r in LnAddr.format_bolt11_routing_info_as_human_readable(r_tags))
         routing_e = QTextEdit(str(r_tags))
         routing_e.setReadOnly(True)
         grid.addWidget(QLabel(_("Routing Hints") + ':'), 9, 0)
