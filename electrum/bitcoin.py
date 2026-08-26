@@ -439,7 +439,7 @@ def script_to_address(script: bytes, *, net=None) -> Optional[str]:
 def address_to_script(addr: str, *, net=None) -> bytes:
     if net is None: net = constants.net
     if not is_address(addr, net=net):
-        raise BitcoinException(f"invalid bitcoin address: {addr}")
+        raise BitcoinException(f"invalid bitcoin address: {neuter_bitcoin_address(addr)}")
     witver, witprog = segwit_addr.decode_segwit_address(net.SEGWIT_HRP, addr)
     if witprog is not None:
         if not (0 <= witver <= 16):
@@ -453,6 +453,17 @@ def address_to_script(addr: str, *, net=None) -> bytes:
     else:
         raise BitcoinException(f'unknown address type: {addrtype}')
     return script
+
+
+def neuter_bitcoin_address(addr: str) -> str:
+    """Truncate a bitcoin address, for display in errors that might get sent to the crash reporter,
+    to reduce harm to the user's privacy.
+    """
+    assert isinstance(addr, str), type(addr)
+    if len(addr) <= 7:
+        return addr
+    neutered_addr = addr[:5] + '..' + addr[-2:]
+    return f"{neutered_addr!r} (len={len(addr)})"
 
 
 class OnchainOutputType(Enum):
@@ -470,7 +481,7 @@ def address_to_payload(addr: str, *, net=None) -> Tuple[OnchainOutputType, bytes
     """Return (type, pubkey hash / witness program) for an address."""
     if net is None: net = constants.net
     if not is_address(addr, net=net):
-        raise BitcoinException(f"invalid bitcoin address: {addr}")
+        raise BitcoinException(f"invalid bitcoin address: {neuter_bitcoin_address(addr)}")
     witver, witprog = segwit_addr.decode_segwit_address(net.SEGWIT_HRP, addr)
     if witprog is not None:
         if witver == 0:
@@ -528,7 +539,10 @@ class BaseDecodeError(BitcoinException): pass
 
 
 def base_encode(v: bytes, *, base: int) -> str:
-    """ encode v, which is a string of bytes, to base58."""
+    """ encode v, which is a string of bytes, to base58.
+
+    note: time complexity is O(len(v)^2), due to big-int arithmetic.
+    """
     assert_bytes(v)
     if base not in (58, 43):
         raise ValueError('not supported base: {}'.format(base))
@@ -541,10 +555,11 @@ def base_encode(v: bytes, *, base: int) -> str:
     newlen = len(v)
 
     num = int.from_bytes(v, byteorder='big')
-    string = b""
+    string_rev = bytearray()
     while num:
         num, idx = divmod(num, base)
-        string = chars[idx:idx + 1] + string
+        string_rev += chars[idx:idx + 1]
+    string = string_rev[::-1]
 
     result = chars[0:1] * (origlen - newlen) + string
     return result.decode('ascii')
@@ -552,6 +567,8 @@ def base_encode(v: bytes, *, base: int) -> str:
 
 def base_decode(v: Union[bytes, str], *, base: int) -> Optional[bytes]:
     """ decode v into a string of len bytes.
+
+    note: time complexity is O(len(v)^2), due to big-int arithmetic.
 
     based on the work of David Keijser in https://github.com/keis/base58
     """

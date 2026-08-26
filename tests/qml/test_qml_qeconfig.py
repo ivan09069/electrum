@@ -1,7 +1,12 @@
+import os
+import shutil
+import tempfile
 from typing import TYPE_CHECKING
+
 from electrum import SimpleConfig
 from electrum.gui.qml.qeconfig import QEConfig
-from tests.qt_util import QETestCase, qt_test
+
+from .qt_util import QETestCase, qt_test
 
 if TYPE_CHECKING:
     from PyQt6.QtCore import QRegularExpression
@@ -10,7 +15,16 @@ if TYPE_CHECKING:
 class TestConfig(QETestCase):
     @classmethod
     def setUpClass(cls):
-        QEConfig(SimpleConfig())
+        super().setUpClass()
+        cls._unittest_base_path = tempfile.mkdtemp(prefix="electrum-unittest-base-")
+        electrum_path = os.path.join(cls._unittest_base_path, "electrum")
+        config = SimpleConfig({'electrum_path': electrum_path})
+        QEConfig(config)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls._unittest_base_path)
+        super().tearDownClass()
 
     def setUp(self):
         super().setUp()

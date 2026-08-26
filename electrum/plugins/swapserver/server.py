@@ -95,7 +95,7 @@ class HttpSwapServer(Logger, EventListener):
                         "minimal": sm._min_amount,
                     },
                     "fees": {
-                        "percentage": sm.percentage,
+                        "percentage": float(sm.percentage),  # cast to float for <= 4.7.1 backwards compatibility
                         "minerFees": {
                             "baseAsset": {
                                 "normal": sm.mining_fee,
@@ -122,7 +122,7 @@ class HttpSwapServer(Logger, EventListener):
 
     async def add_swap_invoice(self, r):
         request = await r.json()
-        self.sm.server_add_swap_invoice(request)
+        await self.sm.server_add_swap_invoice(request)
         return web.json_response({})
 
     async def create_normal_swap(self, r):

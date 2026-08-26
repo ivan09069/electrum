@@ -380,7 +380,7 @@ class TxInput:
             return
         # note that tx might be a PartialTransaction
         # serialize and de-serialize tx now. this might e.g. convert a complete PartialTx to a Tx
-        tx = tx_from_any(str(tx))
+        tx = tx_from_any(str(tx), sanitize=False)
         # 'utxo' field should not be a PSBT:
         if not tx.is_complete():
             return
@@ -1228,7 +1228,8 @@ class Transaction:
             tx.convert_all_utxos_to_witness_utxos()
             is_complete = False
         tx_bytes = tx.serialize_as_bytes()
-        return base_encode(tx_bytes, base=43), is_complete
+        tx_base43 = base_encode(tx_bytes, base=43)  # FIXME this takes quadratic time in len(tx)
+        return tx_base43, is_complete
 
     def txid(self) -> Optional[str]:
         if self._cached_txid is None:
@@ -1269,6 +1270,7 @@ class Transaction:
         timeout=None,
     ) -> None:
         """note: it is recommended to call add_info_from_wallet first, as this can save some network requests"""
+        from .interface import NetworkException
         if not self.is_missing_info_from_network():
             return
         if progress_cb is None:
@@ -1302,6 +1304,8 @@ class Transaction:
         except Exception as e:
             has_errored = True
             _logger.error(f"tx.add_info_from_network() got exc: {e!r}")
+            if isinstance(e, NetworkException) and not ignore_network_issues:
+                raise
         finally:
             has_finished = True
             progress_cb(TxinDataFetchProgress(num_tasks_done, num_tasks_total, has_errored, has_finished))
@@ -1343,6 +1347,9 @@ class Transaction:
     def is_rbf_enabled(self) -> bool:
         """Whether the tx explicitly signals BIP-0125 replace-by-fee."""
         return any([txin.nsequence < 0xffffffff - 1 for txin in self.inputs()])
+
+    def is_coinbase_tx(self) -> bool:
+        return self.inputs()[0].is_coinbase_input()
 
     def estimated_size(self) -> int:
         """Return an estimated virtual tx size in vbytes.
@@ -1488,8 +1495,44 @@ def convert_raw_tx_to_hex(raw: Union[str, bytes]) -> str:
     raw tx hex string."""
     if not raw:
         raise ValueError("empty string")
-    raw_unstripped = raw
-    if isinstance(raw, str):
+    # try hex
+    try:
+        return binascii.unhexlify(raw).hex()
+    except Exception:
+        pass
+    # try base64
+    if raw[0:6] in ('cHNidP', b'cHNidP'):  # base64 psbt
+        try:
+            return base64.b64decode(raw, validate=True).hex()
+        except Exception:
+            pass
+    # try base43
+    try:
+        # FIXME This takes quadratic time in len(tx).
+        #       We could prefix all txs we base43-serialize with e.g. "BASE43TX:",
+        #       (and break-compat with old versions).  Then at least we would not attempt
+        #       the expensive deser here if it's not needed.
+        if len(raw) > 30_000:
+            # note: base_decode for this length takes around 0.2 sec on my laptop.
+            # note: We only use/expect base43 inside QR codes. The max data a QR can fit is around 4 KB,
+            #       serializing that to b43 results in a length of ~5500. 30k is already over 5x that.
+            raise ValueError("raw tx too large for base43")
+        return base_decode(raw, base=43).hex()
+    except Exception:
+        pass
+    # raw bytes
+    if isinstance(raw, (bytes, bytearray)):
+        return raw.hex()
+    raise ValueError(f"failed to recognize transaction encoding for txt: {raw[:30]}...")
+
+
+def tx_from_any(
+        raw: Union[str, bytes], *,
+        deserialize: bool = True,
+        sanitize: bool = True,
+) -> Union['PartialTransaction', 'Transaction']:
+    # re.sub is expensive, set sanitize to False if raw data is not from user input
+    if isinstance(raw, str) and sanitize:
         # remove all whitespace characters, anywhere, for convenience
         # - leading/trailing whitespaces are quite common for user-input
         # - newlines in the middle can also happen, e.g. when copying a raw tx from a pdf
@@ -1499,32 +1542,6 @@ def convert_raw_tx_to_hex(raw: Union[str, bytes]) -> str:
         #       consider:  "\n".encode().hex() == "0a"
         #       For str, this is a non-issue and safe to do.
         raw = re.sub(r'\s', '', raw)
-    # try hex
-    try:
-        return binascii.unhexlify(raw).hex()
-    except Exception:
-        pass
-    # try base43
-    try:
-        return base_decode(raw, base=43).hex()
-    except Exception:
-        pass
-    # try base64
-    if raw[0:6] in ('cHNidP', b'cHNidP'):  # base64 psbt
-        try:
-            return base64.b64decode(raw, validate=True).hex()
-        except Exception:
-            pass
-    # raw bytes (do not strip whitespaces in this case)
-    if isinstance(raw_unstripped, bytes):
-        return raw_unstripped.hex()
-    raise ValueError(f"failed to recognize transaction encoding for txt: {raw[:30]}...")
-
-
-def tx_from_any(raw: Union[str, bytes], *,
-                deserialize: bool = True) -> Union['PartialTransaction', 'Transaction']:
-    if isinstance(raw, bytearray):
-        raw = bytes(raw)
     raw = convert_raw_tx_to_hex(raw)
     try:
         return PartialTransaction.from_raw_psbt(raw)

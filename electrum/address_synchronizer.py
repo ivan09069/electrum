@@ -204,6 +204,7 @@ class AddressSynchronizer(Logger, EventListener):
         assert self.network is None, "already started"
         self.network = network
         if self.network is not None:
+            assert network.config is self.config
             self.synchronizer = Synchronizer(self)
             self.verifier = SPV(self.network, self)
             self.asyncio_loop = network.asyncio_loop
@@ -293,7 +294,7 @@ class AddressSynchronizer(Logger, EventListener):
         if tx_hash is None:
             raise Exception("cannot add tx without txid to wallet history")
         # For sanity, try to serialize and deserialize tx early:
-        tx_from_any(str(tx))  # see if raises (no-side-effects)
+        tx_from_any(str(tx), sanitize=False)  # see if raises (no-side-effects)
         with self.lock:
             # NOTE: returning if tx in self.transactions might seem like a good idea
             # BUT we track is_mine inputs in a txn, and during subsequent calls
@@ -1047,7 +1048,6 @@ class AddressSynchronizer(Logger, EventListener):
     def get_spender(self, outpoint: str) -> Optional[str]:
         """
         returns txid spending outpoint.
-        subscribes to addresses as a side effect.
         """
         prev_txid, index = outpoint.split(':')
         spender_txid = self.db.get_spent_outpoint(prev_txid, int(index))
@@ -1055,15 +1055,15 @@ class AddressSynchronizer(Logger, EventListener):
         tx_mined_status = self.get_tx_height(spender_txid)
         if tx_mined_status.height() in [TX_HEIGHT_LOCAL, TX_HEIGHT_FUTURE]:
             spender_txid = None
-        if not spender_txid:
-            return None
+        return spender_txid
+
+    def subscribe_to_outputs(self, spender_txid: str):
         spender_tx = self.get_transaction(spender_txid)
         for i, o in enumerate(spender_tx.outputs()):
             if o.address is None:
                 continue
             if not self.is_mine(o.address):
                 self.add_address(o.address)
-        return spender_txid
 
     def get_tx_mined_depth(self, txid: str):
         if not txid:

@@ -56,7 +56,6 @@ from .util import (
 from . import bitcoin
 from .bitcoin import is_address,  hash_160, COIN
 from .bip32 import BIP32Node
-from .i18n import _
 from .transaction import (
     Transaction, multisig_script, PartialTransaction, PartialTxOutput, tx_from_any, PartialTxInput, TxOutpoint,
     convert_raw_tx_to_hex
@@ -85,6 +84,10 @@ if TYPE_CHECKING:
     from .network import Network
     from .daemon import Daemon
     from electrum.lnworker import PaymentInfo
+
+
+def _(_):  # break translation
+    raise Exception("The CLI is intentionally always non-localized")
 
 
 known_commands = {}  # type: Dict[str, Command]
@@ -274,7 +277,7 @@ class Commands(Logger):
         """List wallets open in daemon"""
         return [
             {
-                'path': w.db.storage.path,
+                'path': w.storage.get_path(),
                 'synchronized': w.is_up_to_date(),
                 'unlocked': not w.has_password() or (w.get_unlocked_password() is not None),
             }
@@ -315,7 +318,7 @@ class Commands(Logger):
             config=self.config)
         return {
             'seed': d['seed'],
-            'path': d['wallet'].storage.path,
+            'path': d['wallet'].storage.get_path(),
             'msg': d['msg'],
         }
 
@@ -339,7 +342,7 @@ class Commands(Logger):
             encrypt_file=encrypt_file,
             config=self.config)
         return {
-            'path': d['wallet'].storage.path,
+            'path': d['wallet'].storage.get_path(),
             'msg': d['msg'],
         }
 
@@ -397,10 +400,19 @@ class Commands(Logger):
 
     def _setconfig(self, key, value):
         value = self._setconfig_normalize_value(key, value)
-        if self.daemon and key == SimpleConfig.RPC_USERNAME.key():
-            self.daemon.commands_server.rpc_user = value
-        if self.daemon and key == SimpleConfig.RPC_PASSWORD.key():
-            self.daemon.commands_server.rpc_password = value
+        if self.daemon and key in (
+            SimpleConfig.RPC_USERNAME.key(),
+            SimpleConfig.RPC_PASSWORD.key(),
+            SimpleConfig.RPC_HOST.key(),
+            SimpleConfig.RPC_PORT.key(),
+            SimpleConfig.RPC_SOCKET_TYPE.key(),
+            SimpleConfig.RPC_SOCKET_FILEPATH.key(),
+        ):
+            raise UserFacingException(
+                "error: RPC server settings cannot be changed for already running daemon. "
+                "Stop the daemon first, and run 'setconfig' in --offline mode. "
+                "\nFor example: '$ electrum -o setconfig rpcport 7777'."
+            )
         if Plugins.is_plugin_enabler_config_key(key):
             self.config.set_key(key, value)
         else:
@@ -905,7 +917,16 @@ class Commands(Logger):
         arg:str:address:Bitcoin address
         arg:str:message:Clear text message. Use quotes if it contains spaces.
         """
-        sig = wallet.sign_message(address, message, password)
+        if not isinstance(address, str):
+            raise UserFacingException(f"address must be a str instead of {type(address)}")
+        if not isinstance(message, str):
+            raise UserFacingException(f"message must be a str instead of {type(message)}")
+        sig = wallet.sign_message(
+            address=address,
+            message=message,
+            password=password,
+            strip_inputs=False,  # respect whitespaces for CLI
+        )
         return base64.b64encode(sig).decode('ascii')
 
     @command('')
@@ -916,12 +937,18 @@ class Commands(Logger):
         arg:str:message:Clear text message. Use quotes if it contains spaces.
         arg:str:signature:The signature, base64-encoded.
         """
-        try:
-            sig = base64.b64decode(signature, validate=True)
-        except binascii.Error:
-            return False
-        message = util.to_bytes(message)
-        return bitcoin.verify_usermessage_with_address(address, sig, message)
+        if not isinstance(address, str):
+            raise UserFacingException(f"address must be a str instead of {type(address)}")
+        if not isinstance(signature, str):
+            raise UserFacingException(f"signature must be a str instead of {type(signature)}")
+        if not isinstance(message, str):
+            raise UserFacingException(f"message must be a str instead of {type(message)}")
+        return Abstract_Wallet.verify_message(
+            address=address,
+            signature=signature,
+            message=message,
+            strip_inputs=False,  # respect whitespaces for CLI
+        )
 
     def _get_fee_policy(self, fee: str, feerate: str):
         if fee is not None and feerate is not None:
@@ -1222,15 +1249,11 @@ class Commands(Logger):
         arg:str:pubkey:Public key
         arg:str:message:Clear text message. Use quotes if it contains spaces.
         """
-        if not is_hex_str(pubkey):
-            raise UserFacingException(f"pubkey must be a hex string instead of {repr(pubkey)}")
-        try:
-            message = to_bytes(message)
-        except TypeError:
-            raise UserFacingException(f"message must be a string-like object instead of {repr(message)}")
-        public_key = ecc.ECPubkey(bfh(pubkey))
-        encrypted = crypto.ecies_encrypt_message(public_key, message)
-        return encrypted.decode('utf-8')
+        if not isinstance(pubkey, str):
+            raise UserFacingException(f"pubkey must be a str instead of {type(pubkey)}")
+        if not isinstance(message, str):
+            raise UserFacingException(f"message must be a str instead of {type(message)}")
+        return Abstract_Wallet.encrypt_message(pubkey=pubkey, message=message)
 
     @command('wp')
     async def decrypt(self, pubkey, encrypted, password=None, wallet: Abstract_Wallet = None) -> str:
@@ -1239,11 +1262,11 @@ class Commands(Logger):
         arg:str:encrypted:Encrypted message
         arg:str:pubkey:Public key of one of your wallet addresses
         """
-        if not is_hex_str(pubkey):
-            raise UserFacingException(f"pubkey must be a hex string instead of {repr(pubkey)}")
-        if not isinstance(encrypted, (str, bytes, bytearray)):
-            raise UserFacingException(f"encrypted must be a string-like object instead of {repr(encrypted)}")
-        decrypted = wallet.decrypt_message(pubkey, encrypted, password)
+        if not isinstance(pubkey, str):
+            raise UserFacingException(f"pubkey must be a str instead of {type(pubkey)}")
+        if not isinstance(encrypted, str):
+            raise UserFacingException(f"encrypted must be a str instead of {type(encrypted)}")
+        decrypted = wallet.decrypt_message(pubkey=pubkey, message=encrypted, password=password)
         return decrypted.decode('utf-8')
 
     @command('w')
@@ -1524,6 +1547,9 @@ class Commands(Logger):
     async def export_lightning_preimage(self, payment_hash: str, wallet: 'Abstract_Wallet' = None) -> Optional[str]:
         """
         Returns the stored preimage of the given payment_hash if it is known.
+
+        note: Exporting a preimage does not require the wallet password (RPC access is enough).
+              We don't consider preimages as sensitive as private keys.
 
         arg:str:payment_hash: Hash of the preimage
         """
@@ -1829,12 +1855,28 @@ class Commands(Logger):
         return wallet.lnworker.node_keypair.pubkey.hex() + (('@' + listen_addr) if listen_addr else '')
 
     @command('wl')
-    async def list_channels(self, public: bool = False, wallet: Abstract_Wallet = None):
-        """Return the list of private channels in the wallet
+    async def list_channels(self, public: bool = False, private: bool = False, active: bool = False, open: bool = False, wallet: Abstract_Wallet = None):
+        """Return the list of channels in the wallet
 
-        arg:bool:public:list public channels instead.
+        arg:bool:public:list only public channels
+        arg:bool:private:list only private channels
+        arg:bool:open:list only open channels
+        arg:bool:active:list only active channels
         """
         from .lnutil import LOCAL, REMOTE, format_short_channel_id
+        if public and private:
+            raise Exception("incompatible options")
+        def _filter(chan):
+            if public and not chan.is_public():
+                return False
+            if private and chan.is_public():
+                return False
+            if active and not chan.is_redeemed():
+                return False
+            if open and not chan.is_open():
+                return False
+            return True
+
         return [
             {
                 'short_channel_id': format_short_channel_id(chan.short_channel_id) if chan.short_channel_id else None,
@@ -1852,7 +1894,7 @@ class Commands(Logger):
                 'remote_reserve': chan.config[LOCAL].reserve_sat,
                 'local_unsettled_sent': chan.balance_tied_up_in_htlcs_by_direction(LOCAL, direction=SENT) // 1000,
                 'remote_unsettled_sent': chan.balance_tied_up_in_htlcs_by_direction(REMOTE, direction=SENT) // 1000,
-            } for chan in wallet.lnworker.channels.values() if not (public != chan.is_public())
+            } for chan in wallet.lnworker.channels.values() if _filter(chan)
         ]
 
     @command('wl')
@@ -1905,6 +1947,42 @@ class Commands(Logger):
             raise UserFacingException(f'Unknown channel {channel_point}')
         coro = wallet.lnworker.force_close_channel(chan_id) if force else wallet.lnworker.close_channel(chan_id)
         return await coro
+
+    @command('wpl')
+    async def delete_channel(self, channel_point, password=None, wallet: Abstract_Wallet = None):
+        """
+        Delete a lightning channel (only if channel-open funding has expired, or channel is in REDEEMED state)
+
+        arg:str:channel_point:channel point
+        """
+        txid, index = channel_point.split(':')
+        chan_id, _ = channel_id_from_funding_tx(txid, int(index))
+        if chan_id not in wallet.lnworker.channels:
+            raise UserFacingException(f'Unknown channel {channel_point}')
+        chan = wallet.lnworker.channels[chan_id]
+        if chan.is_backup():
+            raise UserFacingException(f'{channel_point} is a channel backup, use delete_channel_backup instead')
+        if not chan.can_be_deleted():
+            raise UserFacingException(f'Cannot delete channel {channel_point}')
+        wallet.lnworker.remove_channel(chan_id)
+
+    @command('wpl')
+    async def delete_channel_backup(self, channel_point, password=None, wallet: Abstract_Wallet = None):
+        """
+        Delete a lightning channel backup (only if imported, or channel is in REDEEMED state)
+
+        arg:str:channel_point:channel point
+        """
+        txid, index = channel_point.split(':')
+        chan_id, _ = channel_id_from_funding_tx(txid, int(index))
+        if chan_id not in wallet.lnworker.channel_backups:
+            raise UserFacingException(f'Unknown channel backup {channel_point}')
+        chan = wallet.lnworker.channel_backups[chan_id]
+        if not chan.is_backup():
+            raise UserFacingException(f'{channel_point} is not a channel backup, use delete_channel instead')
+        if not chan.can_be_deleted():
+            raise UserFacingException(f'Cannot delete channel backup {channel_point}')
+        wallet.lnworker.remove_channel_backup(chan_id)
 
     @command('wnpl')
     async def request_force_close(self, channel_point, connection_string=None, password=None, wallet: Abstract_Wallet = None):
@@ -1963,6 +2041,36 @@ class Commands(Logger):
         return tx.serialize()
 
     @command('wnl')
+    async def list_channel_htlcs(self, channel_point, password=None, wallet: Abstract_Wallet = None):
+        """
+        return the settled, inflight and failed htlcs of a channel
+
+        arg:str:channel_point:Channel outpoint
+        """
+        txid, index = channel_point.split(':')
+        chan_id, _ = channel_id_from_funding_tx(txid, int(index))
+        if chan_id not in wallet.lnworker.channels:
+            raise UserFacingException(f'Unknown channel {channel_point}')
+        chan = wallet.lnworker.channels[chan_id]
+        folders = {
+            'settled': [],
+            'inflight': [],
+            'failed': [],
+        }
+        for rhash, plist in chan.get_payments().items():
+            for htlc_with_status in plist:
+                if (fl := folders.get(htlc_with_status.status)) is None:
+                    continue
+                fl.append({
+                    'id': htlc_with_status.htlc.htlc_id,
+                    'direction': 'OUT' if htlc_with_status.direction == SENT else 'IN',
+                    'amount': htlc_with_status.htlc.amount_msat,
+                    'timestamp': htlc_with_status.htlc.timestamp,
+                    'payment_hash': htlc_with_status.htlc.payment_hash.hex()
+                })
+        return folders
+
+    @command('wnl')
     async def get_watchtower_ctn(self, channel_point, wallet: Abstract_Wallet = None):
         """
         Return the local watchtower's ctn of channel. used in regtests
@@ -2016,7 +2124,7 @@ class Commands(Logger):
         result = {}
         for offer in offers:
             result[offer.server_npub] = {
-                "percentage_fee": offer.pairs.percentage,
+                "percentage_fee": float(offer.pairs.percentage),
                 "max_forward_sat": offer.pairs.max_forward,
                 "max_reverse_sat": offer.pairs.max_reverse,
                 "min_amount_sat": offer.pairs.min_amount,
@@ -2027,7 +2135,8 @@ class Commands(Logger):
     @command('wnpl')
     async def normal_swap(self, onchain_amount, lightning_amount, password=None, wallet: Abstract_Wallet = None):
         """
-        Normal submarine swap: send on-chain BTC, receive on Lightning
+        Normal submarine swap: send on-chain BTC, receive on Lightning.
+        Note: fees can change between the dryrun and the following swap request, causing the request to error and require a new dryrun.
 
         arg:decimal_or_dryrun:lightning_amount:Amount to be received, in BTC. Set it to 'dryrun' to receive a value
         arg:decimal_or_dryrun:onchain_amount:Amount to be sent, in BTC. Set it to 'dryrun' to receive a value
@@ -2051,6 +2160,13 @@ class Commands(Logger):
             else:
                 lightning_amount_sat = satoshis(lightning_amount)
                 onchain_amount_sat = satoshis(onchain_amount)
+                required_onchain_amount_sat = sm.get_send_amount(lightning_amount_sat, is_reverse=False)
+                # same 1 sat rounding tolerance as in `request_normal_swap()`
+                if not required_onchain_amount_sat \
+                        or not (onchain_amount_sat - 1 <= required_onchain_amount_sat <= onchain_amount_sat):
+                    raise UserFacingException(
+                        "Swap fees have changed since the dryrun was calculated. Do a new dryrun first."
+                        + f" ({required_onchain_amount_sat} != {onchain_amount_sat} sat)")
                 txid = await wallet.lnworker.swap_manager.normal_swap(
                     transport=transport,
                     lightning_amount_sat=lightning_amount_sat,
@@ -2059,7 +2175,7 @@ class Commands(Logger):
                 )
 
         return {
-            'txid': txid,
+            'txid': txid,  # FIXME sync name with reverse_swap cmd that uses "funding_txid"
             'lightning_amount': format_satoshis(lightning_amount_sat),
             'onchain_amount': format_satoshis(onchain_amount_sat),
         }
@@ -2069,7 +2185,8 @@ class Commands(Logger):
         self, lightning_amount, onchain_amount, prepayment='dryrun', password=None, wallet: Abstract_Wallet = None,
     ):
         """
-        Reverse submarine swap: send on Lightning, receive on-chain
+        Reverse submarine swap: send on Lightning, receive on-chain.
+        Note: fees can change between the dryrun and the following swap request, causing the request to error and require a new dryrun.
 
         arg:decimal_or_dryrun:lightning_amount:Amount to be sent, in BTC. Set it to 'dryrun' to receive a value
         arg:decimal_or_dryrun:onchain_amount:Amount to be received, in BTC. Set it to 'dryrun' to receive a value
@@ -2085,32 +2202,38 @@ class Commands(Logger):
                 raise TimeoutError("Could not find configured swap provider. Setup another one. See 'get_submarine_swap_providers'")
             if onchain_amount == 'dryrun':
                 lightning_amount_sat = satoshis(lightning_amount)
-                onchain_amount_sat = sm.get_recv_amount(lightning_amount_sat, is_reverse=True)
+                onchain_recv_amount_sat = sm.get_recv_amount(lightning_amount_sat, is_reverse=True)
                 assert prepayment == "dryrun", f"Cannot use {prepayment=} in dryrun. Set it to 'dryrun'."
                 prepayment_sat = 2 * sm.mining_fee
                 funding_txid = None
             elif lightning_amount == 'dryrun':
-                onchain_amount_sat = satoshis(onchain_amount)
-                lightning_amount_sat = sm.get_send_amount(onchain_amount_sat, is_reverse=True)
+                onchain_recv_amount_sat = satoshis(onchain_amount)
+                lightning_amount_sat = sm.get_send_amount(onchain_recv_amount_sat, is_reverse=True)
                 assert prepayment == "dryrun", f"Cannot use {prepayment=} in dryrun. Set it to 'dryrun'."
                 prepayment_sat = 2 * sm.mining_fee
                 funding_txid = None
             else:
-                lightning_amount_sat = satoshis(lightning_amount)
-                claim_fee = sm.get_fee_for_txbatcher()
-                onchain_amount_sat = satoshis(onchain_amount) + claim_fee
                 assert prepayment != "dryrun", "Provide the 'prepayment' obtained from the dryrun."
+                lightning_amount_sat = satoshis(lightning_amount)
+                requested_recv_amount_sat = satoshis(onchain_amount)
+                claim_fee = sm.get_fee_for_txbatcher()
+                funding_utxo_value_sat = requested_recv_amount_sat + claim_fee
+                onchain_recv_amount_sat = sm.get_recv_amount(lightning_amount_sat, is_reverse=True)
+                if not onchain_recv_amount_sat or onchain_recv_amount_sat < requested_recv_amount_sat:
+                    raise UserFacingException(
+                        "Swap fees have changed since the dryrun was calculated. Do a new dryrun first."
+                        + f" ({onchain_recv_amount_sat} < {requested_recv_amount_sat} sat)")
                 prepayment_sat = satoshis(prepayment)
                 funding_txid = await wallet.lnworker.swap_manager.reverse_swap(
                     transport=transport,
                     lightning_amount_sat=lightning_amount_sat,
-                    expected_onchain_amount_sat=onchain_amount_sat,
+                    expected_onchain_amount_sat=funding_utxo_value_sat,
                     prepayment_sat=prepayment_sat,
                 )
         return {
             'funding_txid': funding_txid,
             'lightning_amount': format_satoshis(lightning_amount_sat),
-            'onchain_amount': format_satoshis(onchain_amount_sat),
+            'onchain_amount': format_satoshis(onchain_recv_amount_sat),
             'prepayment': format_satoshis(prepayment_sat)
         }
 
@@ -2331,7 +2454,7 @@ def subparser_call(self, parser, namespace, values, option_string=None):
         parser = self._name_parser_map[parser_name]
     except KeyError:
         tup = parser_name, ', '.join(self._name_parser_map)
-        msg = _('unknown parser {!r} (choices: {})').format(*tup)
+        msg = 'unknown parser {!r} (choices: {})'.format(*tup)
         raise ArgumentError(self, msg)
     # parse all the remaining options into the namespace
     # store any unrecognized options on the object, so that the top
@@ -2404,6 +2527,10 @@ def add_global_options(parser, suppress=False):
     group.add_argument(
         "--forgetconfig", action="store_true", dest=SimpleConfig.CONFIG_FORGET_CHANGES.key(), default=None,
         help=argparse.SUPPRESS if suppress else "Forget config on exit")
+    group.add_argument(
+        # Note: default value is False and not None, so that behaviour cannot be modified by editing the config file
+        "--nohardening", action="store_true", dest=SimpleConfig.DISABLE_MEMORY_HARDENING_LINUX.key(), default=False,
+        help=argparse.SUPPRESS if suppress else "Disable memory hardening (linux)")
 
 
 def get_simple_parser():
@@ -2436,7 +2563,7 @@ def get_parser():
     subparsers = parser.add_subparsers(dest='cmd', metavar='<command>')
     # gui
     parser_gui = subparsers.add_parser('gui', description="Run Electrum's Graphical User Interface.", help="Run GUI (default)")
-    parser_gui.add_argument("url", nargs='?', default=None, help="bitcoin URI (or bip70 file)")
+    parser_gui.add_argument("url", nargs='?', default=None, help="bitcoin URI")
     parser_gui.add_argument("-g", "--gui", dest=SimpleConfig.GUI_NAME.key(), help="select graphical user interface", choices=['qt', 'text', 'stdio', 'qml'])
     parser_gui.add_argument("-m", action="store_true", dest=SimpleConfig.GUI_QT_HIDE_ON_STARTUP.key(), default=False, help="hide GUI on startup")
     parser_gui.add_argument("-L", "--lang", dest=SimpleConfig.LOCALIZATION_LANGUAGE.key(), default=None, help="default language used in GUI")

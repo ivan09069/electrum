@@ -34,18 +34,16 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QIntValidator
 
 from electrum.i18n import _
-from electrum import blockchain
 from electrum.interface import ServerAddr, PREFERRED_NETWORK_PROTOCOL
 from electrum.network import Network, ProxySettings, is_valid_host, is_valid_port
 from electrum.logging import get_logger
 from electrum.util import is_valid_websocket_url
 from electrum.gui import messages
 
+from electrum.gui.common_qt.util import QtEventListener, qt_event_listener
 from .util import (
-    Buttons, CloseButton, HelpButton, read_QIcon, char_width_in_lineedit, PasswordLineEdit, QtEventListener,
-    qt_event_listener, Spinner, HelpLabel
+    Buttons, CloseButton, HelpButton, read_QIcon, char_width_in_lineedit, PasswordLineEdit, Spinner, HelpLabel
 )
-
 
 _logger = get_logger(__name__)
 
@@ -156,7 +154,7 @@ class NodesListWidget(QTreeWidget):
         chains = network.get_blockchains()
         n_chains = len(chains)
         for chain_id, interfaces in chains.items():
-            b = blockchain.blockchains.get(chain_id)
+            b = self.network.bc_mgr.blockchains.get(chain_id)
             if b is None:
                 continue
             name = b.get_name()

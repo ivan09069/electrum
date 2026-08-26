@@ -2,7 +2,7 @@ from enum import IntEnum
 from typing import Optional
 from urllib.parse import urlparse
 
-from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, QTimer, pyqtEnum
+from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject, QTimer, pyqtEnum, QVariant
 
 from electrum.logging import get_logger
 from electrum.invoices import (
@@ -14,9 +14,11 @@ from electrum.payment_identifier import PaymentIdentifier, PaymentIdentifierType
 from electrum.i18n import _
 from electrum.network import Network
 
+from electrum.gui.common_qt.util import QtEventListener, qt_event_listener
+
 from .qewallet import QEWallet
 from .qetypes import QEAmount
-from .util import QtEventListener, qt_event_listener, status_update_timer_interval
+from .util import status_update_timer_interval
 
 
 class QERequestDetails(QObject, QtEventListener):
@@ -67,17 +69,18 @@ class QERequestDetails(QObject, QtEventListener):
 
     @qt_event_listener
     def on_event_request_status(self, wallet, key, status):
-        if wallet == self._wallet.wallet and key == self._key:
+        if self._wallet and wallet == self._wallet.wallet and key == self._key:
             self._logger.debug('request status %d for key %s' % (status, key))
             self.statusChanged.emit()
 
     walletChanged = pyqtSignal()
-    @pyqtProperty(QEWallet, notify=walletChanged)
-    def wallet(self):
+    @pyqtProperty(QVariant, notify=walletChanged)
+    def wallet(self) -> QEWallet:
         return self._wallet
 
     @wallet.setter
     def wallet(self, wallet: QEWallet):
+        assert wallet is None or isinstance(wallet, QEWallet)
         if self._wallet != wallet:
             self._wallet = wallet
             self.walletChanged.emit()

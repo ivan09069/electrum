@@ -20,7 +20,7 @@ git -C "$PROJECT_ROOT" rev-parse 2>/dev/null || fail "Building outside a git clo
 export GCC_STRIP_BINARIES="1"
 
 # pinned versions
-PYTHON_VERSION=3.12.11
+PYTHON_VERSION=3.12.13
 PY_VER_MAJOR="3.12"  # as it appears in fs paths
 PKG2APPIMAGE_COMMIT="a9c85b7e61a3a883f4a35c41c5decb5af88b6b5d"
 
@@ -44,7 +44,7 @@ verify_hash "$CACHEDIR/appimagetool" "46fdd785094c7f6e545b61afcfb0f3d98d8eab243f
 # appimagetool tags a new release (see https://github.com/AppImage/appimagetool/pull/47)
 
 download_if_not_exist "$CACHEDIR/Python-$PYTHON_VERSION.tar.xz" "https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tar.xz"
-verify_hash "$CACHEDIR/Python-$PYTHON_VERSION.tar.xz" "c30bb24b7f1e9a19b11b55a546434f74e739bb4c271a3e3a80ff4380d49f7adb"
+verify_hash "$CACHEDIR/Python-$PYTHON_VERSION.tar.xz" "c08bc65a81971c1dd5783182826503369466c7e67374d1646519adf05207b684"
 
 
 
@@ -245,10 +245,10 @@ rm -rf "$PYDIR"/site-packages/PyQt6/Qt.so
 find "$APPDIR" -path '*/__pycache__*' -delete
 # although note that *.dist-info might be needed by certain packages...
 # e.g. slip10 uses importlib that needs it
-for f in "$PYDIR"/site-packages/slip10-*.dist-info; do mv "$f" "$(echo "$f" | sed s/\.dist-info/\.dist-info2/)"; done
+for f in "$PYDIR"/site-packages/{slip10,trezor}-*.dist-info; do mv "$f" "$(echo "$f" | sed s/\.dist-info/\.dist-info2/)"; done
 rm -rf "$PYDIR"/site-packages/*.dist-info/
 rm -rf "$PYDIR"/site-packages/*.egg-info/
-for f in "$PYDIR"/site-packages/slip10-*.dist-info2; do mv "$f" "$(echo "$f" | sed s/\.dist-info2/\.dist-info/)"; done
+for f in "$PYDIR"/site-packages/{slip10,trezor}-*.dist-info2; do mv "$f" "$(echo "$f" | sed s/\.dist-info2/\.dist-info/)"; done
 
 
 find -exec touch -h -d '2000-11-11T11:11:11+00:00' {} +

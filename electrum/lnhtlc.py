@@ -1,5 +1,6 @@
 from copy import deepcopy
 from typing import Sequence, Tuple, Dict, TYPE_CHECKING, Set
+import threading
 
 from .lnutil import SENT, RECEIVED, LOCAL, REMOTE, HTLCOwner, UpdateAddHtlc, Direction, FeeUpdate
 from .util import bfh, with_lock
@@ -21,7 +22,7 @@ LOG_TEMPLATE = {
 
 class HTLCManager:
 
-    def __init__(self, log: 'StoredDict', *, initiator=None, initial_feerate=None):
+    def __init__(self, log: 'StoredDict', *, initiator=None, initial_feerate=None, lock=None):
 
         if len(log) == 0:
             # note: "htlc_id" keys in dict are str! but due to json_db magic they can *almost* be treated as int...
@@ -41,7 +42,7 @@ class HTLCManager:
         # lnchannel sometimes calls us with Channel.db_lock (== log.lock) already taken,
         # and we ourselves often take log.lock (via StoredDict.__getitem__).
         # Hence, to avoid deadlocks, we reuse this same lock.
-        self.lock = log.lock
+        self.lock = lock if lock else threading.RLock()
 
         self._init_maybe_active_htlc_ids()
 
@@ -558,30 +559,30 @@ class HTLCManager:
         return htlcs
 
     def received_in_ctn(self, local_ctn: int) -> Sequence[UpdateAddHtlc]:
+        """Returns HTLCs (that *THEY proposed*) that just became irrevocably fulfilled, in local_ctn.
+        These HTLCs have *just* been irrevocably removed, now from both parties' ctxs.
         """
-        received htlcs that became fulfilled when we send a revocation.
-        we check only local, because they are committed in the remote ctx first.
-        """
+        # we check only ctx_owner=LOCAL, because that's where the removal happens last
         return self._get_htlcs_that_got_removed_exactly_at_ctn(local_ctn,
                                                                ctx_owner=LOCAL,
                                                                htlc_proposer=REMOTE,
                                                                log_action='settles')
 
     def sent_in_ctn(self, remote_ctn: int) -> Sequence[UpdateAddHtlc]:
+        """Returns HTLCs (that *WE proposed*) that just became irrevocably fulfilled, in remote_ctn.
+        These HTLCs have *just* been irrevocably removed, now from both parties' ctxs.
         """
-        sent htlcs that became fulfilled when we received a revocation
-        we check only remote, because they are committed in the local ctx first.
-        """
+        # we check only ctx_owner=REMOTE, because that's where the removal happens last
         return self._get_htlcs_that_got_removed_exactly_at_ctn(remote_ctn,
                                                                ctx_owner=REMOTE,
                                                                htlc_proposer=LOCAL,
                                                                log_action='settles')
 
     def failed_in_ctn(self, remote_ctn: int) -> Sequence[UpdateAddHtlc]:
+        """Returns HTLCs (that *WE proposed*) that just became irrevocably failed, in remote_ctn.
+        These HTLCs have *just* been irrevocably removed, now from both parties' ctxs.
         """
-        sent htlcs that became failed when we received a revocation
-        we check only remote, because they are committed in the local ctx first.
-        """
+        # we check only ctx_owner=REMOTE, because that's where the removal happens last
         return self._get_htlcs_that_got_removed_exactly_at_ctn(remote_ctn,
                                                                ctx_owner=REMOTE,
                                                                htlc_proposer=LOCAL,

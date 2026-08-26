@@ -347,7 +347,7 @@ class ElectrumGui(BaseElectrumGui, Logger):
 
     def get_window_for_wallet(self, wallet):
         for window in self.windows:
-            if window.wallet.storage.path == wallet.storage.path:
+            if window.wallet.storage.get_path() == wallet.storage.get_path():
                 return window
 
     @count_wizards_in_progress
@@ -368,6 +368,17 @@ class ElectrumGui(BaseElectrumGui, Logger):
             self.logger.warning(f"terms of use not accepted, rejecting to start new window")
             return None
 
+        def __handle_wallet_loading_exc(exc: Exception, pos):
+            if isinstance(exc, UserFacingException) \
+                    or isinstance(exc, WalletFileException) and not exc.should_report_crash:
+                self.logger.exception(f"{pos=}")
+                custom_message_box(icon=QMessageBox.Icon.Warning,
+                                   parent=None,
+                                   title=_('Error'),
+                                   text=_('Cannot load wallet') + f' ({pos}):\n' + str(exc))
+            else:
+                send_exception_to_crash_reporter(exc)
+
         wallet = None
         # Try to open with daemon first. If this succeeds, there won't be a wizard at all
         # (the wallet main window will appear directly).
@@ -385,14 +396,7 @@ class ElectrumGui(BaseElectrumGui, Logger):
             except WalletUnfinished:
                 pass  # open with wizard below
             except Exception as e:
-                self.logger.exception('')
-                err_text = str(e) if isinstance(e, WalletFileException) else repr(e)
-                custom_message_box(icon=QMessageBox.Icon.Warning,
-                                   parent=None,
-                                   title=_('Error'),
-                                   text=_('Cannot load wallet') + ' (1):\n' + err_text)
-                if isinstance(e, WalletFileException) and e.should_report_crash:
-                    send_exception_to_crash_reporter(e)
+                __handle_wallet_loading_exc(e, 1)
                 # if app is starting, still let wizard appear
                 if not app_is_starting:
                     return
@@ -410,16 +414,7 @@ class ElectrumGui(BaseElectrumGui, Logger):
         except UserCancelled:
             return
         except Exception as e:
-            self.logger.exception('')
-            if isinstance(e, UserFacingException) \
-                    or isinstance(e, WalletFileException) and not e.should_report_crash:
-                err_text = str(e) if isinstance(e, WalletFileException) else repr(e)
-                custom_message_box(icon=QMessageBox.Icon.Warning,
-                                   parent=None,
-                                   title=_('Error'),
-                                   text=_('Cannot load wallet') + '(2) :\n' + err_text)
-            else:
-                send_exception_to_crash_reporter(e)
+            __handle_wallet_loading_exc(e, 2)
             if app_is_starting:
                 # If we raise in this context, there are no more fallbacks, we will shut down.
                 # Worst case scenario, we might have gotten here without user interaction,
@@ -440,6 +435,14 @@ class ElectrumGui(BaseElectrumGui, Logger):
         window.activateWindow()
         if uri:
             window.show_send_tab()
+            # Handle URI defensively - local attacker with access to RPC server and config file could get here:
+            #   - tell user something happened
+            window.notify(_("Updated 'Pay To' field to handle external URI"))
+            #   - clear all fields in Send tab:
+            #     - perhaps user was just filling out the fields, trying to make another payment.
+            #       e.g. if the given URI does not have an amount, we should clear the amount field
+            window.send_tab.do_clear()
+            #   - update "Pay To" field (and maybe others)
             window.send_tab.set_payment_identifier(uri)
         return window
 
@@ -457,7 +460,7 @@ class ElectrumGui(BaseElectrumGui, Logger):
         if d['wallet_is_open']:
             wallet_path = standardize_path(d['wallet_name'])
             for window in self.windows:
-                if window.wallet.storage.path == wallet_path:
+                if window.wallet.storage.get_path() == wallet_path:
                     return window.wallet
             raise Exception('found by wizard but not here?!')
 
@@ -515,7 +518,7 @@ class ElectrumGui(BaseElectrumGui, Logger):
         self.build_tray_menu()
         run_hook('on_close_window', window)
         if window.should_stop_wallet_on_close:
-            self.daemon.stop_wallet(window.wallet.storage.path)
+            self.daemon.stop_wallet(window.wallet.storage.get_path())
 
     def reload_window(self, window):
         # bump counter so that we do not close the app

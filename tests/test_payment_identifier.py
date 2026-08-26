@@ -184,6 +184,17 @@ class TestPaymentIdentifier(ElectrumTestCase):
         self.assertEqual(PaymentIdentifierType.LNURL, pi.type)
         self.assertTrue(pi.need_resolve())
 
+        # test with lud17 prefix
+        unsupported_lud_17_lnurl_c = f"lnurlc://service.io/?q=3fc3645b439ce8e7"
+        pi = PaymentIdentifier(None, unsupported_lud_17_lnurl_c)
+        self.assertFalse(pi.is_valid())
+
+        valid_lud_17_lnurl_w = f"lnurlw://service.io/?q=3fc3645b439ce8e7"
+        pi = PaymentIdentifier(None, valid_lud_17_lnurl_w)
+        self.assertTrue(pi.is_valid())
+        self.assertEqual(PaymentIdentifierType.LNURL, pi.type)
+        self.assertTrue(pi.need_resolve())
+
     @patch('electrum.payment_identifier.request_lnurl')
     def test_lnurl_pay_resolve(self, mock_request_lnurl):
         """Test LNURL-pay (LNURL6) with mocked resolve"""
@@ -390,16 +401,6 @@ class TestPaymentIdentifier(ElectrumTestCase):
             self.assertEqual(PaymentIdentifierType.EMAILLIKE, pi.type)
             self.assertFalse(pi.is_available())
             self.assertTrue(pi.need_resolve())
-
-    def test_bip70(self):
-        pi_str = 'bitcoin:?r=https://test.bitpay.com/i/87iLJoaYVyJwFXtdassQJv'
-        pi = PaymentIdentifier(None, pi_str)
-        self.assertTrue(pi.is_valid())
-        self.assertEqual(PaymentIdentifierType.BIP70, pi.type)
-        self.assertFalse(pi.is_available())
-        self.assertTrue(pi.need_resolve())
-
-        # TODO resolve mock
 
     async def test_invoice_from_payment_identifier(self):
         # amount, expired, message, lightning w matching amount

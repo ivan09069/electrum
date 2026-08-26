@@ -1,5 +1,6 @@
-from PyQt6.QtCore import Qt, QAbstractListModel, QModelIndex
-from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot
+from typing import TYPE_CHECKING
+
+from PyQt6.QtCore import Qt, QAbstractListModel, QModelIndex, pyqtProperty, pyqtSignal, pyqtSlot
 
 from electrum.lnchannel import ChannelState
 from electrum.lnutil import LOCAL, REMOTE
@@ -7,9 +8,13 @@ from electrum.logging import get_logger
 from electrum.util import Satoshis
 from electrum.gui import messages
 
+from electrum.gui.common_qt.util import qt_event_listener, QtEventListener
+
 from .qetypes import QEAmount
-from .util import QtEventListener, qt_event_listener
 from .qemodelfilter import QEFilterProxyModel
+
+if TYPE_CHECKING:
+    from electrum.wallet import Abstract_Wallet
 
 
 class QEChannelListModel(QAbstractListModel, QtEventListener):
@@ -26,7 +31,7 @@ class QEChannelListModel(QAbstractListModel, QtEventListener):
 
     _network_signal = pyqtSignal(str, object)
 
-    def __init__(self, wallet, parent=None):
+    def __init__(self, wallet: 'Abstract_Wallet', parent=None):
         super().__init__(parent)
         self.wallet = wallet
         self._channels = []

@@ -413,41 +413,12 @@ class CoinCap(ExchangeBase):
                      for h in history['data']])
 
 
-class CoinDesk(ExchangeBase):
-
-    async def get_currencies(self):
-        dicts = await self.get_json('api.coindesk.com',
-                              '/v1/bpi/supported-currencies.json')
-        return [d['currency'] for d in dicts]
-
-    async def get_rates(self, ccy):
-        json = await self.get_json('api.coindesk.com',
-                             '/v1/bpi/currentprice/%s.json' % ccy)
-        result = {ccy: to_decimal(json['bpi'][ccy]['rate_float'])}
-        return result
-
-    def history_starts(self):
-        return {'USD': '2012-11-30', 'EUR': '2013-09-01'}
-
-    def history_ccys(self):
-        return self.history_starts().keys()
-
-    async def request_history(self, ccy):
-        start = self.history_starts()[ccy]
-        end = datetime.today().strftime('%Y-%m-%d')
-        # Note ?currency and ?index don't work as documented.  Sigh.
-        query = ('/v1/bpi/historical/close.json?start=%s&end=%s'
-                 % (start, end))
-        json = await self.get_json('api.coindesk.com', query)
-        return json['bpi']
-
-
 class CoinGecko(ExchangeBase):
 
     async def get_rates(self, ccy):
         json = await self.get_json('api.coingecko.com', '/api/v3/exchange_rates')
         return dict([(ccy.upper(), to_decimal(d['value']))
-                     for ccy, d in json['rates'].items()])
+                     for ccy, d in json['rates'].items() if d.get('value') is not None])
 
     def history_ccys(self):
         # CoinGecko seems to have historical data for all ccys it supports

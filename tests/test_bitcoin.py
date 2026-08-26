@@ -660,6 +660,13 @@ class Test_bitcoin(ElectrumTestCase):
         self.assertEqual(DecodedBech32(None, None, None),
                          segwit_addr.bech32_decode('1p2gdwpf'))
 
+        # without checksum
+        bolt12_str = 'lno1pqps7sjqpgtyzm3qv4uxzmtsd3jjqer9wd3hy6tsw35k7msjzfpy7nz5yqcnygrfdej82um5wf5k2uckyypwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvxg'
+        self.assertEqual(DecodedBech32(None, None, None),
+                         segwit_addr.bech32_decode(bolt12_str, with_checksum=True, ignore_long_length=True))
+        self.assertEqual(DecodedBech32(None, 'lno', [1, 0, 1, 16, 30, 16, 18, 0, 1, 8, 11, 4, 2, 27, 17, 0, 12, 21, 28, 6, 2, 27, 11, 16, 13, 17, 18, 18, 0, 25, 3, 5, 14, 13, 17, 23, 4, 26, 11, 16, 14, 17, 20, 22, 30, 27, 16, 18, 2, 9, 1, 4, 30, 19, 2, 20, 4, 0, 24, 19, 4, 8, 3, 9, 13, 25, 18, 7, 10, 28, 27, 20, 14, 9, 20, 22, 10, 28, 24, 22, 4, 4, 1, 14, 29, 17, 25, 4, 11, 21, 21, 23, 26, 11, 6, 11, 6, 0, 28, 0, 23, 30, 31, 2, 20, 13, 18, 8, 25, 21, 29, 9, 8, 9, 18, 19, 30, 22, 21, 3, 8, 3, 22, 28, 29, 8, 15, 18, 16, 13, 20, 6, 12, 6, 8]),
+                         segwit_addr.bech32_decode(bolt12_str, with_checksum=False, ignore_long_length=True))
+
 
 class Test_xprv_xpub(ElectrumTestCase):
 
@@ -755,6 +762,32 @@ class Test_xprv_xpub(ElectrumTestCase):
             allow_custom_headers=True)
         self.assertEqual(bytes.fromhex("03f18e53f3386a5f9a9d2c369ad3b84b429eb397b4bc69ce600f2d833b54ba32f4"),
                          bip32node2.eckey.get_public_key_bytes(compressed=True))
+
+    def test_bip32_from_xkey_private_key_bad_prefix(self):
+        # A private extended key's key field must be 0x00 || ser256(k).
+        for invalid in (
+            # BIP32 test vector 5: prvkey version / pubkey mismatch
+            "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFGTQQD3dC4H2D5GBj7vWvSQaaBv5cxi9gafk7NF3pnBju6dwKvH"
+            # BIP32 test vector 5: invalid prvkey prefix 04
+            "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFGpWnsj83BHtEy5Zt8CcDr1UiRXuWCmTQLxEK9vbz5gPstX92JQ",
+            # BIP32 test vector 5: invalid prvkey prefix 01
+            "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFAzHGBP2UuGCqWLTAPLcMtD9y5gkZ6Eq3Rjuahrv17fEQ3Qen6J",
+        ):
+            with self.assertRaises(BitcoinException):
+                BIP32Node.from_xkey(invalid)
+
+    def test_bip32_from_xkey_depth0_with_nonzero_child_or_fingerprint(self):
+        # BIP32 requires a depth-0 (master) key to have child number 0 and parent fingerprint 0.
+        for invalid in (
+            # BIP32 test vector 5: zero depth with non-zero parent fingerprint
+            "xprv9s2SPatNQ9Vc6GTbVMFPFo7jsaZySyzk7L8n2uqKXJen3KUmvQNTuLh3fhZMBoG3G4ZW1N2kZuHEPY53qmbZzCHshoQnNf4GvELZfqTUrcv",
+            "xpub661no6RGEX3uJkY4bNnPcw4URcQTrSibUZ4NqJEw5eBkv7ovTwgiT91XX27VbEXGENhYRCf7hyEbWrR3FewATdCEebj6znwMfQkhRYHRLpJ",
+            # BIP32 test vector: zero depth with non-zero index
+            "xprv9s21ZrQH4r4TsiLvyLXqM9P7k1K3EYhA1kkD6xuquB5i39AU8KF42acDyL3qsDbU9NmZn6MsGSUYZEsuoePmjzsB3eFKSUEh3Gu1N3cqVUN",
+            "xpub661MyMwAuDcm6CRQ5N4qiHKrJ39Xe1R1NyfouMKTTWcguwVcfrZJaNvhpebzGerh7gucBvzEQWRugZDuDXjNDRmXzSZe4c7mnTK97pTvGS8",
+        ):
+            with self.assertRaises(BitcoinException):
+                BIP32Node.from_xkey(invalid)
 
     def test_is_bip32_derivation(self):
         self.assertTrue(is_bip32_derivation("m/0'/1"))
