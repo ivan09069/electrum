@@ -1,0 +1,79 @@
+name: minimally regenerate protobuf hardware lock
+
+on:
+  push:
+    branches:
+      - security/protobuf-6.33-hw-minimal
+    paths:
+      - .github/workflows/regenerate-protobuf-hw-minimal.yml
+      - contrib/requirements/requirements-hw.txt
+
+permissions:
+  contents: write
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.10'
+
+      - name: Update protobuf block only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install 'hashin==1.0.5'
+          python -m hashin -r contrib/deterministic-build/requirements-hw.txt protobuf==6.33.6
+          grep -E '^protobuf==6\.33\.6 ' contrib/deterministic-build/requirements-hw.txt
+          ! grep -q '^protobuf==3\.20\.3 ' contrib/deterministic-build/requirements-hw.txt
+
+      - name: Verify deterministic environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/electrum-hw-lock-test"
+          source "$RUNNER_TEMP/electrum-hw-lock-test/bin/activate"
+          python -m pip install --upgrade 'pip==25.1.1'
+          python -m pip install --no-deps -r contrib/deterministic-build/requirements-hw.txt
+          python - <<'PY'
+          from google.protobuf import __version__ as v
+          assert v == '6.33.6', v
+          from bitbox02.communication.generated import hww_pb2
+          print('protobuf', v)
+          print('bitbox02 generated protobuf import: OK')
+          PY
+          PYTHONPATH="$GITHUB_WORKSPACE/electrum/plugins/keepkey/keepkeylib" python - <<'PY'
+          from keepkeylib import messages_pb2
+          m = messages_pb2.Initialize()
+          m.SerializeToString()
+          print('keepkey generated protobuf serialize: OK')
+          PY
+
+      - name: Require lockfile-only deterministic delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code -- . ':(exclude)contrib/deterministic-build/requirements-hw.txt' || {
+            echo 'Unexpected file changed during lock regeneration.' >&2
+            exit 1
+          }
+          git diff --check -- contrib/deterministic-build/requirements-hw.txt
+          git diff -- contrib/deterministic-build/requirements-hw.txt
+
+      - name: Commit regenerated lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add contrib/deterministic-build/requirements-hw.txt
+          git commit -m 'security: update protobuf hardware lock to 6.33.6'
+          git push origin HEAD:security/protobuf-6.33-hw-minimal
